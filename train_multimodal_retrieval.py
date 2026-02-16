@@ -350,8 +350,8 @@ def _ksg_mi(x: np.ndarray, y: np.ndarray, k: int = 5) -> float:
 
     nbrs_x = NearestNeighbors(metric="chebyshev").fit(x)
     nbrs_y = NearestNeighbors(metric="chebyshev").fit(y)
-    nx = np.array([len(idx) - 1 for idx in nbrs_x.radius_neighbors(x, eps, return_distance=False)])
-    ny = np.array([len(idx) - 1 for idx in nbrs_y.radius_neighbors(y, eps, return_distance=False)])
+    nx = _radius_neighbor_counts(nbrs_x, x, eps)
+    ny = _radius_neighbor_counts(nbrs_y, y, eps)
 
     nx = torch.tensor(nx + 1, dtype=torch.float32)
     ny = torch.tensor(ny + 1, dtype=torch.float32)
@@ -382,7 +382,7 @@ def _mixed_mi_discrete_continuous(m: np.ndarray, z: np.ndarray, k: int = 5) -> f
         eps[idx] = dist[:, k_eff] - 1e-15
 
     nbrs_all = NearestNeighbors(metric="chebyshev").fit(z)
-    m_counts = np.array([len(ids) - 1 for ids in nbrs_all.radius_neighbors(z, eps, return_distance=False)])
+    m_counts = _radius_neighbor_counts(nbrs_all, z, eps)
 
     n_x = np.array([counts[np.where(unique == val)[0][0]] for val in m])
     n_x = torch.tensor(n_x, dtype=torch.float32)
@@ -393,6 +393,25 @@ def _mixed_mi_discrete_continuous(m: np.ndarray, z: np.ndarray, k: int = 5) -> f
         + torch.digamma(torch.tensor(n, dtype=torch.float32))
         - (torch.digamma(n_x) + torch.digamma(m_counts)).mean()
     )
+
+
+def _radius_neighbor_counts(
+    nbrs: NearestNeighbors,
+    x: np.ndarray,
+    radii: np.ndarray,
+) -> np.ndarray:
+    """Return counts of neighbors within per-sample radii (excluding self)."""
+    radii = np.asarray(radii, dtype=np.float64)
+    try:
+        return np.array(
+            [len(ids) - 1 for ids in nbrs.radius_neighbors(x, radii, return_distance=False)]
+        )
+    except TypeError:
+        counts = np.zeros(x.shape[0], dtype=np.int64)
+        for i in range(x.shape[0]):
+            ids = nbrs.radius_neighbors(x[i:i + 1], radii[i], return_distance=False)[0]
+            counts[i] = len(ids) - 1
+        return counts
 
 
 def _collect_test_embeddings(
