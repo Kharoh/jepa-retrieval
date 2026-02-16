@@ -251,6 +251,31 @@ class MultimodalViTEncoder(nn.Module):
             attn_maps.append(block.attn.attn_map)
         return attn_maps
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        labels: torch.Tensor = None,
+        include_label: bool = False,
+        return_all_tokens: bool = True
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W) images
+            labels: (B,) label indices
+            include_label: Whether to include label token
+            return_all_tokens: If True, return all tokens; if False, return mean
+
+        Returns:
+            (B, N, embed_dim) or (B, embed_dim) depending on return_all_tokens
+        """
+        x = self.forward_features(x, labels, include_label)
+
+        if return_all_tokens:
+            return x
+        else:
+            # Global average pooling over all tokens
+            return x.mean(dim=1)
+
 
 class AttentionWithMap(nn.Module):
     """Self-attention that stores the last attention map."""
@@ -328,31 +353,6 @@ class BlockWithAttn(nn.Module):
         x = x + self.drop_path(self.attn(self.norm1(x)))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
-    
-    def forward(
-        self, 
-        x: torch.Tensor, 
-        labels: torch.Tensor = None,
-        include_label: bool = False,
-        return_all_tokens: bool = True
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: (B, C, H, W) images
-            labels: (B,) label indices
-            include_label: Whether to include label token
-            return_all_tokens: If True, return all tokens; if False, return mean
-        
-        Returns:
-            (B, N, embed_dim) or (B, embed_dim) depending on return_all_tokens
-        """
-        x = self.forward_features(x, labels, include_label)
-        
-        if return_all_tokens:
-            return x
-        else:
-            # Global average pooling over all tokens
-            return x.mean(dim=1)
 
 
 class MultimodalViTLeJEPA(nn.Module):
