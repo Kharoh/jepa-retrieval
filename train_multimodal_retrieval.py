@@ -228,30 +228,91 @@ def load_mnist_data(config: ExperimentConfig):
     return train_loader, test_loader, test_images, test_labels
 
 
-def extract_features(model: nn.Module, data: torch.Tensor, batch_size: int, device: str):
+def normalize_images(
+    images: torch.Tensor,
+    image_shape: Tuple[int, int, int],
+    normalize_mean: float,
+    normalize_std: float,
+    flatten: bool = False,
+) -> torch.Tensor:
+    """Normalize images with training-time mean/std.
+
+    Supports (B, D) flattened tensors or (B, C, H, W) tensors.
+    """
+    if images.dim() == 2:
+        b = images.shape[0]
+        images = images.view(b, *image_shape)
+    elif images.dim() != 4:
+        raise ValueError("Expected images with shape (B, D) or (B, C, H, W)")
+
+    images = (images - normalize_mean) / normalize_std
+    return images.view(images.shape[0], -1) if flatten else images
+
+
+def extract_features(
+    model: nn.Module,
+    data: torch.Tensor,
+    batch_size: int,
+    device: str,
+    image_shape: Tuple[int, int, int],
+    normalize_mean: float,
+    normalize_std: float,
+):
     """Extract features for linear probe."""
     model.eval()
     dataset = TensorDataset(data)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     features = []
-    
+
     with torch.no_grad():
         for (batch,) in loader:
-            batch = batch.to(device)
+            batch = normalize_images(
+                batch,
+                image_shape=image_shape,
+                normalize_mean=normalize_mean,
+                normalize_std=normalize_std,
+                flatten=True,
+            ).to(device)
             emb, _ = model.encoder.encode_image(batch)
             feats = emb[:, 0, :]
             features.append(feats.detach().cpu())
-    
+
     return torch.cat(features, dim=0)
 
 
 def train_linear_probe(
-    model, train_data, train_labels, test_data, test_labels,
-    epochs: int, lr: float, batch_size: int, device: str
+    model,
+    train_data,
+    train_labels,
+    test_data,
+    test_labels,
+    epochs: int,
+    lr: float,
+    batch_size: int,
+    device: str,
+    image_shape: Tuple[int, int, int],
+    normalize_mean: float,
+    normalize_std: float,
 ):
     """Train linear probe."""
-    train_features = extract_features(model, train_data, batch_size, device)
-    test_features = extract_features(model, test_data, batch_size, device)
+    train_features = extract_features(
+        model,
+        train_data,
+        batch_size,
+        device,
+        image_shape,
+        normalize_mean,
+        normalize_std,
+    )
+    test_features = extract_features(
+        model,
+        test_data,
+        batch_size,
+        device,
+        image_shape,
+        normalize_mean,
+        normalize_std,
+    )
     
     feat_dim = train_features.shape[1]
     probe = nn.Sequential(
@@ -418,6 +479,9 @@ def _collect_test_embeddings(
     model: nn.Module,
     test_loader: DataLoader,
     device: torch.device,
+    image_shape: Tuple[int, int, int],
+    normalize_mean: float,
+    normalize_std: float,
     max_samples: Optional[int] = None,
     with_attention: bool = True,
     rollout_alpha: float = 0.5,
@@ -443,7 +507,13 @@ def _collect_test_embeddings(
 
     with torch.no_grad():
         for images, labels in test_loader:
-            images = images.view(images.shape[0], -1).to(device)
+            images = normalize_images(
+                images,
+                image_shape=image_shape,
+                normalize_mean=normalize_mean,
+                normalize_std=normalize_std,
+                flatten=True,
+            ).to(device)
             labels = labels.to(device)
 
             emb0, _ = model.encoder.encode_image(images)
@@ -548,6 +618,9 @@ def evaluate_information_metrics(
         model,
         test_loader,
         device,
+        image_shape=config.image_shape,
+        normalize_mean=config.normalize_mean,
+        normalize_std=config.normalize_std,
         max_samples=config.info_eval_max_samples,
         with_attention=True,
         rollout_alpha=config.attention_rollout_alpha,
@@ -626,8 +699,30 @@ def evaluate_retrieval(model, test_loader, config, device, max_samples=1000):
     if max_samples is not None:
         max_batches = max(1, math.ceil(max_samples / batch_size))
 
+    norm_images = []
+    norm_labels = []
+    for images, labels in test_loader:
+        norm = normalize_images(
+            images,
+            image_shape=config.image_shape,
+            normalize_mean=config.normalize_mean,
+            normalize_std=config.normalize_std,
+            flatten=False,
+        )
+        norm_images.append(norm)
+        norm_labels.append(labels)
+    norm_images = torch.cat(norm_images, dim=0)
+    norm_labels = torch.cat(norm_labels, dim=0)
+    norm_loader = DataLoader(
+        TensorDataset(norm_images, norm_labels),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=config.pin_memory,
+    )
+
     evaluator = LabelRetrievalEvaluator(model, num_classes=config.num_classes, device=device)
-    return evaluator.evaluate_retrieval(test_loader, max_batches=max_batches, use_emb=True)
+    return evaluator.evaluate_retrieval(norm_loader, max_batches=max_batches, use_emb=True)
 
 
 def run_experiment(config: ExperimentConfig, output_dir: Path, logger):
@@ -728,6 +823,18 @@ def run_experiment(config: ExperimentConfig, output_dir: Path, logger):
                 info_metrics["rollout_P_to_L"],
             )
         )
+
+        retrieval_results = evaluate_retrieval(
+            model, test_loader, config, device, 1000
+        )
+        logger.info(
+            f"  M1: {retrieval_results['method1']['accuracy']:.4f} "
+            f"(top3: {retrieval_results['method1']['top3_accuracy']:.4f})"
+        )
+        logger.info(
+            f"  M2: {retrieval_results['method2']['accuracy']:.4f} "
+            f"(top3: {retrieval_results['method2']['top3_accuracy']:.4f})"
+        )
         
         if (epoch + 1) % config.eval_every == 0 or epoch == config.num_epochs - 1:
             logger.info(f"  Evaluating...")
@@ -742,22 +849,15 @@ def run_experiment(config: ExperimentConfig, output_dir: Path, logger):
             
             linear_acc = train_linear_probe(
                 model, train_data, train_labels_tensor, test_images, test_labels,
-                config.linear_probe_epochs, config.linear_probe_lr, 256, device
+                config.linear_probe_epochs,
+                config.linear_probe_lr,
+                256,
+                device,
+                config.image_shape,
+                config.normalize_mean,
+                config.normalize_std,
             )
-            
-            retrieval_results = evaluate_retrieval(
-                model, test_loader, config, device, 1000
-            )
-            
             logger.info(f"  Linear: {linear_acc:.4f}")
-            logger.info(
-                f"  M1: {retrieval_results['method1']['accuracy']:.4f} "
-                f"(top3: {retrieval_results['method1']['top3_accuracy']:.4f})"
-            )
-            logger.info(
-                f"  M2: {retrieval_results['method2']['accuracy']:.4f} "
-                f"(top3: {retrieval_results['method2']['top3_accuracy']:.4f})"
-            )
         
         append_metrics_log(metrics_log, epoch + 1, loss_dict, linear_acc, retrieval_results, info_metrics)
         
