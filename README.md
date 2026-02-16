@@ -81,7 +81,8 @@ Input: Image (32x32) + Label (0-9)
 - `multimodal_models.py`: Model architecture (17KB)
 - `retrieval_eval.py`: Evaluation code (9KB)
 - `train_multimodal_retrieval.py`: Training script (17KB)
-- `plot_results.py`: Plotting utilities (6KB)
+- `plotting_utils.py`: Plotting utilities (6KB)
+- `plot_metrics.py`: Plot MI/CMI + attention flow metrics
 
 ## Usage
 
@@ -105,10 +106,15 @@ python train_multimodal_retrieval.py \\
     --no_multimodal \\
     --epochs 50
 
-# Plot results
-python plot_results.py \\
-    --metrics_csv ./experiments/multimodal/metrics.csv \\
-    --output_dir ./experiments/multimodal/plots
+# Plot training + retrieval curves
+python plotting_utils.py \
+  --metrics_csv ./experiments/multimodal/metrics.csv \
+  --output_dir ./experiments/multimodal/plots
+
+# Plot MI/CMI + attention-flow metrics
+python plot_metrics.py \
+  --metrics_csv ./experiments/multimodal/metrics.csv \
+  --output_dir ./experiments/multimodal/plots
 ```
 
 ### Hyperparameters

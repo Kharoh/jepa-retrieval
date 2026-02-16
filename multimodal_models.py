@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Tuple, Dict
+from typing import Tuple, Dict, List
 
 import torch
 import torch.nn as nn
 from torchvision.ops import MLP
-import timm
-from timm.models.vision_transformer import Block
+from timm.models.vision_transformer import Mlp
+from timm.layers import DropPath
 
 
 class SIGReg(torch.nn.Module):
@@ -147,9 +147,9 @@ class MultimodalViTEncoder(nn.Module):
         # Stochastic depth decay rule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         
-        # Transformer blocks
+        # Transformer blocks (custom to expose attention maps)
         self.blocks = nn.ModuleList([
-            Block(
+            BlockWithAttn(
                 dim=embed_dim,
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
@@ -238,6 +238,95 @@ class MultimodalViTEncoder(nn.Module):
         
         x = self.norm(x)
         
+        return x
+
+    def get_attention_maps(self) -> List[torch.Tensor]:
+        """Return attention maps from the last forward pass.
+
+        Returns:
+            List of tensors with shape (B, heads, N, N) per block.
+        """
+        attn_maps = []
+        for block in self.blocks:
+            attn_maps.append(block.attn.attn_map)
+        return attn_maps
+
+
+class AttentionWithMap(nn.Module):
+    """Self-attention that stores the last attention map."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.attn_map = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        self.attn_map = attn.detach()
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class BlockWithAttn(nn.Module):
+    """Transformer block that exposes attention maps."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = False,
+        proj_drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.0,
+        norm_layer: nn.Module = nn.LayerNorm,
+    ):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = AttentionWithMap(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            act_layer=nn.GELU,
+            drop=proj_drop,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
     
     def forward(
