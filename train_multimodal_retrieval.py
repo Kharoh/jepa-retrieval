@@ -146,6 +146,8 @@ class ExperimentConfig:
     info_eval_max_samples: Optional[int] = None
     attention_rollout_alpha: float = 0.5
     compute_attention_rollout: bool = True
+    appearance_quantile: Optional[float] = None
+    attention_quantile: Optional[float] = None
     
     # System
     device: str = "cuda"
@@ -482,6 +484,8 @@ def _collect_test_embeddings(
     image_shape: Tuple[int, int, int],
     normalize_mean: float,
     normalize_std: float,
+    appearance_quantile: Optional[float] = None,
+    attention_quantile: Optional[float] = None,
     max_samples: Optional[int] = None,
     with_attention: bool = True,
     rollout_alpha: float = 0.5,
@@ -505,6 +509,65 @@ def _collect_test_embeddings(
     label_index = (1 if has_cls else 0) + num_patches
     patch_indices = np.arange((1 if has_cls else 0), (1 if has_cls else 0) + num_patches)
 
+    def _attention_interaction_scores(attn_maps: List[torch.Tensor]) -> np.ndarray:
+        patch_idx = torch.tensor(patch_indices, device=attn_maps[0].device)
+        l2p_vals = []
+        p2l_vals = []
+        for attn in attn_maps:
+            l2p = attn[:, :, label_index, patch_idx].sum(dim=-1).mean(dim=1)
+            p2l = attn[:, :, patch_idx, label_index].mean(dim=-1).mean(dim=1)
+            l2p_vals.append(l2p)
+            p2l_vals.append(p2l)
+        l2p_avg = torch.stack(l2p_vals, dim=0).mean(dim=0)
+        p2l_avg = torch.stack(p2l_vals, dim=0).mean(dim=0)
+        interaction = 0.5 * (l2p_avg + p2l_avg)
+        return interaction.detach().cpu().numpy()
+
+    label_counts = None
+    appearance_threshold = None
+    attention_threshold = None
+
+    if appearance_quantile is not None or attention_quantile is not None:
+        label_counts = {}
+        attention_scores = []
+        seen_samples = 0
+
+        with torch.no_grad():
+            for images, labels in test_loader:
+                labels_np = labels.numpy()
+                for label in labels_np:
+                    label_counts[label] = label_counts.get(label, 0) + 1
+
+                if attention_quantile is not None:
+                    images_norm = normalize_images(
+                        images,
+                        image_shape=image_shape,
+                        normalize_mean=normalize_mean,
+                        normalize_std=normalize_std,
+                        flatten=True,
+                    ).to(device)
+                    labels_tensor = labels.to(device)
+                    model.encoder.encode_multimodal(images_norm, labels_tensor)
+                    attn_maps = model.encoder.backbone.get_attention_maps()
+                    if all(attn is not None for attn in attn_maps):
+                        attention_scores.append(_attention_interaction_scores(attn_maps))
+
+                seen_samples += labels_np.shape[0]
+                if max_samples is not None and seen_samples >= max_samples:
+                    break
+
+        if appearance_quantile is not None and label_counts:
+            counts = np.array(list(label_counts.values()), dtype=np.float64)
+            appearance_threshold = float(np.quantile(counts, appearance_quantile))
+
+        if attention_quantile is not None:
+            if not attention_scores:
+                raise ValueError("Attention quantile requested but no attention scores computed.")
+            attention_scores_arr = np.concatenate(attention_scores, axis=0)
+            attention_threshold = float(np.quantile(attention_scores_arr, attention_quantile))
+
+    collected = 0
+
     with torch.no_grad():
         for images, labels in test_loader:
             images = normalize_images(
@@ -519,9 +582,30 @@ def _collect_test_embeddings(
             emb0, _ = model.encoder.encode_image(images)
             emb1, _ = model.encoder.encode_multimodal(images, labels)
 
-            z0_list.append(emb0.squeeze(1).cpu().numpy())
-            z1_list.append(emb1.squeeze(1).cpu().numpy())
-            m_list.append(labels.cpu().numpy())
+            keep_mask = torch.ones(labels.size(0), dtype=torch.bool, device=labels.device)
+            if appearance_threshold is not None and label_counts is not None:
+                counts_tensor = torch.tensor(
+                    [label_counts[int(lbl.item())] for lbl in labels],
+                    device=labels.device,
+                    dtype=torch.float32,
+                )
+                keep_mask &= counts_tensor >= appearance_threshold
+
+            if attention_threshold is not None:
+                attn_maps = model.encoder.backbone.get_attention_maps()
+                if all(attn is not None for attn in attn_maps):
+                    scores = torch.tensor(
+                        _attention_interaction_scores(attn_maps),
+                        device=labels.device,
+                        dtype=torch.float32,
+                    )
+                    keep_mask &= scores >= attention_threshold
+
+            if keep_mask.any():
+                z0_list.append(emb0.squeeze(1)[keep_mask].cpu().numpy())
+                z1_list.append(emb1.squeeze(1)[keep_mask].cpu().numpy())
+                m_list.append(labels[keep_mask].cpu().numpy())
+                collected += int(keep_mask.sum().item())
 
             if with_attention:
                 attn_maps = model.encoder.backbone.get_attention_maps()
@@ -540,8 +624,11 @@ def _collect_test_embeddings(
                     attn_metrics["rollout_P_to_L"] += roll_p2l * batch_size
                     attn_metrics["num_samples"] += batch_size
 
-            if max_samples is not None and sum(len(arr) for arr in m_list) >= max_samples:
+            if max_samples is not None and collected >= max_samples:
                 break
+
+    if not z0_list:
+        return np.empty((0,)), np.empty((0,)), np.empty((0,)), attn_metrics
 
     z0 = np.concatenate(z0_list, axis=0)
     z1 = np.concatenate(z1_list, axis=0)
@@ -614,6 +701,13 @@ def evaluate_information_metrics(
     device: torch.device,
 ) -> Dict[str, float]:
     """Compute MI/CMI metrics and attention flows on the test set."""
+    for name, value in (
+        ("appearance_quantile", config.appearance_quantile),
+        ("attention_quantile", config.attention_quantile),
+    ):
+        if value is not None and not (0.0 <= value <= 1.0):
+            raise ValueError(f"{name} must be between 0 and 1, got {value}.")
+
     z0, z1, m, attn_metrics = _collect_test_embeddings(
         model,
         test_loader,
@@ -621,11 +715,16 @@ def evaluate_information_metrics(
         image_shape=config.image_shape,
         normalize_mean=config.normalize_mean,
         normalize_std=config.normalize_std,
+        appearance_quantile=config.appearance_quantile,
+        attention_quantile=config.attention_quantile,
         max_samples=config.info_eval_max_samples,
         with_attention=True,
         rollout_alpha=config.attention_rollout_alpha,
         compute_rollout=config.compute_attention_rollout,
     )
+
+    if z0.size == 0:
+        raise ValueError("No samples left after applying appearance/attention thresholds.")
 
     z0_red = _standardize_and_pca(z0, config.pca_dim)
     z1_red = _standardize_and_pca(z1, config.pca_dim)
@@ -891,6 +990,8 @@ def main():
     parser.add_argument("--info_eval_max_samples", type=int, default=None)
     parser.add_argument("--attention_rollout_alpha", type=float, default=0.5)
     parser.add_argument("--no_attention_rollout", action="store_true")
+    parser.add_argument("--appearance_quantile", type=float, default=None)
+    parser.add_argument("--attention_quantile", type=float, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data_dir", type=str, default="./data")
     
@@ -917,6 +1018,8 @@ def main():
         info_eval_max_samples=args.info_eval_max_samples,
         attention_rollout_alpha=args.attention_rollout_alpha,
         compute_attention_rollout=not args.no_attention_rollout,
+        appearance_quantile=args.appearance_quantile,
+        attention_quantile=args.attention_quantile,
         seed=args.seed,
         data_dir=args.data_dir,
     )
